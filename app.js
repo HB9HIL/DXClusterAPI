@@ -300,17 +300,17 @@ app.use((req, res, next) => {
 
 // Skip logging for /spots and /health endpoints to reduce noise
 morgan.token('skip-logging', (req, res) => {
-    return (req.url.startsWith(config.baseUrl + '/spots') || req.url.startsWith(config.baseUrl + '/health')) ? 'skip' : null;
+    return (req.url.startsWith(config.baseUrl + '/health')) ? 'skip' : null;
 });
 
 if (morganStream) {
     app.use(morgan(':remote-addr - :remote-user [:date[clf]] ":method :url HTTP/:http-version" :status :res[content-length] ":referrer" ":user-agent" :response-time ms', { 
         stream: morganStream,
-        skip: (req, res) => req.url.startsWith(config.baseUrl + '/spots') || req.url.startsWith(config.baseUrl + '/health')
+        skip: (req, res) => req.url.startsWith(config.baseUrl + '/health')
     }));
 }
 app.use(morgan(':remote-addr - :remote-user [:date[clf]] ":method :url HTTP/:http-version" :status :res[content-length] ":referrer" ":user-agent" :response-time ms', {
-    skip: (req, res) => req.url.startsWith(config.baseUrl + '/spots') || req.url.startsWith(config.baseUrl + '/health')
+    skip: (req, res) => req.url.startsWith(config.baseUrl + '/health')
 }));
 app.use(cors({ origin: '*' }));
 
