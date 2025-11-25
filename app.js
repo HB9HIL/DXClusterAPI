@@ -115,8 +115,9 @@ if (process.env.WEBPORT !== undefined || process.env.MODE !== undefined) {
         // WebSocket configuration
         websocketEnabled: process.env.WEBSOCKET_ENABLED !== 'false',
         
-        // Demo page configuration
-        demoEnabled: process.env.DEMO_ENABLED !== 'false',
+        // Live page configuration
+        livePageEnabled: process.env.LIVE_PAGE_ENABLED !== 'false',
+        livePagePassword: process.env.LIVE_PAGE_PASSWORD || '',
         
         // Logging configuration
         fileLoggingEnabled: process.env.FILE_LOGGING_ENABLED !== 'false',
@@ -137,7 +138,8 @@ if (process.env.WEBPORT !== undefined || process.env.MODE !== undefined) {
         config.apiv2Enabled = config.apiv2Enabled !== false;
         config.apiv2Key = config.apiv2Key || '';
         config.websocketEnabled = config.websocketEnabled !== false;
-        config.demoEnabled = config.demoEnabled !== false;
+        config.livePageEnabled = config.livePageEnabled !== false;
+        config.livePagePassword = config.livePagePassword || '';
         config.fileLoggingEnabled = config.fileLoggingEnabled !== false;
         config.logRetentionDays = config.logRetentionDays || 3;
         config.spotMaxAge = config.spotMaxAge || 120;
@@ -352,7 +354,7 @@ const analytics = new Analytics({
     enabled: config.analyticsEnabled,
     dataFile: path.join(__dirname, 'data', 'analytics.json'),
     saveInterval: 5 * 60 * 1000, // 5 minutes
-    skipPaths: ['/health', '/demo', '/analytics']
+    skipPaths: ['/health', '/info', '/analytics']
 });
 
 // Apply analytics tracking middleware
@@ -419,9 +421,9 @@ function getApiInfo() {
     }
     endpoints.info = config.baseUrl + '/info';
     
-    // Only include demo endpoint if enabled
-    if (config.demoEnabled) {
-        endpoints.demo = config.baseUrl + '/demo';
+    // Only include live page endpoint if enabled
+    if (config.livePageEnabled) {
+        endpoints.live = config.baseUrl + '/live';
     }
     
     return {
@@ -447,25 +449,47 @@ app.get(config.baseUrl + '/info', (req, res) => {
     res.json(getApiInfo());
 });
 
-// Serve static files (for demo page) - only if enabled
-if (config.demoEnabled) {
-    // Add middleware to set no-cache and no-index headers for demo page
-    app.use(config.baseUrl + '/demo', (req, res, next) => {
-        // Prevent caching
+// Serve live page - only if enabled
+if (config.livePageEnabled) {
+    const livePagePath = path.join(__dirname, 'views', 'live', 'index.html');
+    
+    // Live page route with authentication
+    app.get(config.baseUrl + '/live', (req, res) => {
+        // HTTP Basic Authentication (if password is set)
+        if (config.livePagePassword) {
+            const authHeader = req.headers.authorization;
+            
+            if (!authHeader || !authHeader.startsWith('Basic ')) {
+                res.setHeader('WWW-Authenticate', 'Basic realm="DXClusterAPI Live Monitor"');
+                return res.status(401).send('Authentication required');
+            }
+            
+            // Decode Basic Auth credentials
+            const base64Credentials = authHeader.split(' ')[1];
+            const credentials = Buffer.from(base64Credentials, 'base64').toString('ascii');
+            const [username, password] = credentials.split(':');
+            
+            // Verify password (username is ignored)
+            if (password !== config.livePagePassword) {
+                res.setHeader('WWW-Authenticate', 'Basic realm="DXClusterAPI Live Monitor"');
+                return res.status(401).send('Invalid password');
+            }
+        }
+        
+        // Set no-cache and no-index headers
         res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate, private');
         res.setHeader('Pragma', 'no-cache');
         res.setHeader('Expires', '0');
-        
-        // Prevent search engine indexing
         res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive, nosnippet');
         
-        next();
+        // Send the HTML file
+        res.sendFile(livePagePath);
     });
     
-    app.use(config.baseUrl + '/demo', express.static(path.join(__dirname, 'public')));
-    console.log('Demo page enabled at ' + config.baseUrl + '/demo');
+    console.log('Live page enabled at ' + config.baseUrl + '/live' + 
+                (config.livePagePassword ? ' (password protected)' : ''));
 } else {
-    console.log('Demo page disabled');
+    console.log('Live page disabled');
 }
 
 // API Analytics endpoint - shows who is using the API
@@ -608,7 +632,10 @@ app.get(config.baseUrl + '/health', (req, res) => {
             } : false,
             analytics: config.analyticsEnabled,
             websocket: config.websocketEnabled,
-            demo: config.demoEnabled,
+            livePage: {
+                enabled: config.livePageEnabled,
+                passwordProtected: config.livePagePassword && config.livePagePassword.length > 0
+            },
             metrics: metrics.getStatus(),
             rateLimiter: rateLimiter.getStatus(),
             apiv1: {
@@ -634,6 +661,47 @@ app.get(config.baseUrl + '/metrics', async (req, res) => {
     } catch (error) {
         console.error('Error generating metrics:', error);
         res.status(500).json({ error: 'Failed to generate metrics' });
+    }
+});
+
+/**
+ * GET /logs - Retrieve recent log entries (last 1000 lines)
+ * Only available when file logging is enabled
+ */
+app.get(config.baseUrl + '/logs', (req, res) => {
+    if (!config.fileLoggingEnabled) {
+        return res.status(503).json({ error: 'File logging is not enabled' });
+    }
+    
+    try {
+        const today = new Date();
+        const fmtDate = (d) => {
+            const y = d.getFullYear();
+            const m = String(d.getMonth() + 1).padStart(2, '0');
+            const dd = String(d.getDate()).padStart(2, '0');
+            return `${y}${m}${dd}`;
+        };
+        
+        const logFile = path.join(LOG_DIR, `app-${fmtDate(today)}.log`);
+        
+        if (!fs.existsSync(logFile)) {
+            return res.json({ logs: [], message: 'No log file found for today' });
+        }
+        
+        // Read log file and get last 1000 lines
+        const logContent = fs.readFileSync(logFile, 'utf8');
+        const lines = logContent.split('\n').filter(line => line.trim());
+        const recentLines = lines.slice(-1000);
+        
+        res.json({
+            logs: recentLines,
+            total: lines.length,
+            showing: recentLines.length,
+            file: path.basename(logFile)
+        });
+    } catch (error) {
+        console.error('Error reading log file:', error);
+        res.status(500).json({ error: 'Failed to read log file' });
     }
 });
 
@@ -957,6 +1025,119 @@ function normalizeSpotterCallsign(callsign) {
 }
 
 /**
+ * Sanitizes a value to ensure JSON serializability
+ * Replaces NaN, Infinity, -Infinity with null
+ * @param {*} value - Value to sanitize
+ * @returns {*} - Sanitized value
+ */
+function sanitizeForJSON(value) {
+    if (typeof value === 'number') {
+        if (!isFinite(value)) {
+            return null; // Replace NaN, Infinity, -Infinity with null
+        }
+    }
+    return value;
+}
+
+/**
+ * Ensures DXCC object has consistent structure
+ * @param {object} dxccObj - DXCC object to normalize
+ * @returns {object} - Normalized DXCC object
+ */
+function normalizeDXCCObject(dxccObj) {
+    if (!dxccObj || typeof dxccObj !== 'object') {
+        return {
+            cont: '',
+            entity: '',
+            flag: '',
+            dxcc_id: '',
+            lotw_user: false,
+            lat: null,
+            lng: null,
+            cqz: null
+        };
+    }
+    
+    // Ensure all expected fields exist with proper defaults
+    return {
+        cont: dxccObj.cont || '',
+        entity: dxccObj.entity || '',
+        flag: dxccObj.flag || '',
+        dxcc_id: dxccObj.dxcc_id || '',
+        lotw_user: Boolean(dxccObj.lotw_user),
+        lat: sanitizeForJSON(dxccObj.lat),
+        lng: sanitizeForJSON(dxccObj.lng),
+        cqz: sanitizeForJSON(dxccObj.cqz),
+        // Preserve enrichment fields if present
+        ...(dxccObj.sota_ref !== undefined && { sota_ref: dxccObj.sota_ref || '' }),
+        ...(dxccObj.pota_ref !== undefined && { pota_ref: dxccObj.pota_ref || '' }),
+        ...(dxccObj.iota_ref !== undefined && { iota_ref: dxccObj.iota_ref || '' }),
+        ...(dxccObj.wwff_ref !== undefined && { wwff_ref: dxccObj.wwff_ref || '' }),
+        ...(dxccObj.isContest !== undefined && { isContest: Boolean(dxccObj.isContest) }),
+        ...(dxccObj.contestName && { contestName: dxccObj.contestName }),
+        ...(dxccObj.pota_mode && { pota_mode: dxccObj.pota_mode }),
+        ...(dxccObj.sota_mode && { sota_mode: dxccObj.sota_mode })
+    };
+}
+
+/**
+ * Validates and sanitizes a spot object for JSON serialization
+ * Ensures all numeric values are finite, DXCC objects are consistent,
+ * and the spot can be safely serialized to JSON
+ * @param {object} spot - Spot to validate
+ * @returns {object|null} - Sanitized spot or null if invalid
+ */
+function validateAndSanitizeSpot(spot) {
+    if (!spot || typeof spot !== 'object') {
+        console.warn('[JSON Validation] Spot is not an object');
+        return null;
+    }
+    
+    // Critical fields validation
+    if (!spot.spotted || !spot.spotter || !spot.frequency) {
+        console.warn(`[JSON Validation] Missing critical fields - spotted: ${spot.spotted}, spotter: ${spot.spotter}, frequency: ${spot.frequency}`);
+        return null;
+    }
+    
+    // Validate frequency is finite
+    const freq = sanitizeForJSON(spot.frequency);
+    if (freq === null) {
+        console.warn(`[JSON Validation] Invalid frequency (NaN/Infinity) for ${spot.spotted}: ${spot.frequency}`);
+        return null;
+    }
+    
+    // Normalize DXCC objects to ensure consistent structure
+    const normalizedSpot = {
+        spotter: String(spot.spotter),
+        spotted: String(spot.spotted),
+        frequency: freq,
+        message: String(spot.message || ''),
+        when: spot.when,
+        source: String(spot.source || ''),
+        band: String(spot.band || ''),
+        mode: spot.mode || null,
+        submode: spot.submode || null,
+        dxcc_spotter: normalizeDXCCObject(spot.dxcc_spotter),
+        dxcc_spotted: normalizeDXCCObject(spot.dxcc_spotted)
+    };
+    
+    // Preserve _sourceData if present (internal use only, stripped in API responses)
+    if (spot._sourceData) {
+        normalizedSpot._sourceData = spot._sourceData;
+    }
+    
+    // Final JSON serializability test
+    try {
+        JSON.stringify(normalizedSpot);
+        return normalizedSpot;
+    } catch (error) {
+        console.error(`[JSON Validation] Spot failed JSON serialization test: ${error.message}`);
+        console.error(`[JSON Validation] Problematic spot: spotter=${spot.spotter}, spotted=${spot.spotted}, frequency=${spot.frequency}`);
+        return null;
+    }
+}
+
+/**
  * Processes spots received from different sources and may add additional data points
  */
 async function handlespot(spot, spot_source = "cluster") {
@@ -1105,6 +1286,17 @@ async function handlespot(spot, spot_source = "cluster") {
 		//lookup band
 		dxSpot.band = qrg2band(dxSpot.frequency * 1000);
 
+		// ====================================================================
+		// JSON VALIDATION: Sanitize spot before adding to cache
+		// ====================================================================
+		const sanitizedSpot = validateAndSanitizeSpot(dxSpot);
+		if (!sanitizedSpot) {
+			console.warn(`[JSON Validation] Rejected invalid spot from ${spot_source}: ${spot.spotted} by ${spot.spotter}`);
+			return;
+		}
+		// Replace dxSpot with sanitized version
+		dxSpot = sanitizedSpot;
+
 		// Check spot age - reject if too old
 		// RBN spots use shorter timeout from RBN_SPOT_TIMEOUT
 		// Regular spots use SPOT_MAX_AGE
@@ -1173,8 +1365,10 @@ async function handlespot(spot, spot_source = "cluster") {
 			if (spots.length >= config.maxcache) {
 				const batchSize = Math.max(Math.floor(config.maxcache * 0.1), 10); // Remove at least 10 spots
 				
-				// Remove oldest batch from beginning (no sorting needed - array is already sorted!)
-				const removedSpots = spots.splice(0, batchSize);
+				// Atomic removal: slice creates new array without oldest spots
+				// This prevents race conditions during API reads
+				const removedSpots = spots.slice(0, batchSize);
+				spots = spots.slice(batchSize);
 				
 				// Clean up indexes
 				removedSpots.forEach(spot => removeFromIndexes(spot));
@@ -1201,27 +1395,28 @@ function cleanupExpiredRBN() {
 	
 	const now = Date.now();
 	const rbnMaxAge = config.rbnSpotTimeout * 60 * 1000; // Convert minutes to milliseconds
-	const toRemove = [];
+	let removedCount = 0;
 	
-	// Find all expired RBN spots
-	for (let i = 0; i < spots.length; i++) {
-		const spot = spots[i];
+	// Filter approach: create new array without expired RBN spots
+	// This is safer for concurrent reads than splice operations
+	const filteredSpots = spots.filter(spot => {
 		if (spot.source === 'rbn') {
 			const age = now - Date.parse(spot.when);
 			if (age > rbnMaxAge) {
-				toRemove.push(i);
+				removeFromIndexes(spot);
+				removedCount++;
+				return false; // Remove this spot
 			}
 		}
+		return true; // Keep this spot
+	});
+	
+	// Atomic replacement if any spots were removed
+	if (removedCount > 0) {
+		spots = filteredSpots;
 	}
 	
-	// Remove in reverse order to preserve indexes during splice
-	for (let i = toRemove.length - 1; i >= 0; i--) {
-		const index = toRemove[i];
-		const spot = spots.splice(index, 1)[0];
-		removeFromIndexes(spot);
-	}
-	
-	return toRemove.length;
+	return removedCount;
 }
 
 // -----------------------------------
@@ -1389,8 +1584,9 @@ function cleanupOldSpots() {
     
     const removedCount = initialCount - freshSpots.length;
     if (removedCount > 0) {
-        spots.length = 0;
-        spots.push(...freshSpots);
+        // Atomic replacement: assign new array reference instead of mutating
+        // This prevents race conditions during API reads
+        spots = freshSpots;
         console.log(`Cleanup: removed ${removedCount} old spots (older than ${config.spotMaxAge} minutes)`);
     }
 }
